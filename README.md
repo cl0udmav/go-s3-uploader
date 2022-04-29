@@ -1,7 +1,7 @@
 # go-s3-uploader
 
 ## Usage
-I made this to upload the many hours of cat videos I recorded on my phone. Worth the S3 storage costs.
+I made this to backup the many hours of cat videos on my external hard drive. Worth the S3 storage costs.
 
 - Excludes macOS filename that start with `._`
 
