@@ -5,6 +5,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -13,9 +15,10 @@ import (
 )
 
 var (
-	localPath string
-	bucket    string
-	prefix    string
+	lastRuntime time.Time
+	localPath   string
+	bucket      string
+	prefix      string
 )
 
 func init() {
@@ -28,6 +31,16 @@ func init() {
 }
 
 func main() {
+	// Create a local cache file to check
+	// last script runtime date
+	lastRuntimeFilePath := filepath.Join(localPath, "._S3UploaderLastRuntime")
+	lastRuntimeFileInfo, err := os.Stat(lastRuntimeFilePath)
+	if err == nil {
+		lastRuntime = lastRuntimeFileInfo.ModTime()
+	} else {
+		lastRuntime = time.Time{}
+	}
+
 	walker := make(fileWalk)
 	go func() {
 		// Gather the files to upload by walking the path recursively
@@ -65,25 +78,32 @@ func main() {
 		}
 		log.Println("Uploaded", path, result.Location)
 	}
+
+	currentTimeBytes := []byte(time.Now().UTC().String())
+	os.WriteFile(lastRuntimeFilePath, currentTimeBytes, 0755)
 }
 
 type fileWalk chan string
 
 func (f fileWalk) Walk(path string, info os.FileInfo, err error) error {
-
-	files, err := filepath.Glob("._")
-
-	if err != nil {
-		panic(err)
+	// Exclude directories
+	if info.IsDir() {
+		return nil
 	}
+
 	// Exclude filenames that start with "._"
-	for _, file := range files {
-		if err := os.Remove(file); err != nil {
-			panic(err)
-		}
+	if strings.HasPrefix(info.Name(), "._") {
+		return nil
 	}
-	if !info.IsDir() {
-		f <- path
+
+	// Exclude files that are already up-to-date in S3
+	// We know they're up-to-date if the last script runtime
+	// file hasn't been modified since the last script run
+	if info.ModTime().Before(lastRuntime) {
+		return nil
 	}
+
+	// Add path to fileWalk
+	f <- path
 	return nil
 }
