@@ -69,9 +69,10 @@ func main() {
 		}
 		defer file.Close()
 		result, err := uploader.Upload(context.TODO(), &s3.PutObjectInput{
-			Bucket: &bucket,
-			Key:    aws.String(filepath.Join(prefix, rel)),
-			Body:   file,
+			Bucket:       &bucket,
+			Key:          aws.String(filepath.Join(prefix, rel)),
+			Body:         file,
+			StorageClass: "GLACIER",
 		})
 		if err != nil {
 			log.Fatalln("Failed to upload", path, err)
