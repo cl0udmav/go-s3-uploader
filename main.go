@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
@@ -75,36 +76,55 @@ func main() {
 		existingKeys[*object.Key] = struct{}{}
 	}
 
-	// For each file found walking, upload it to Amazon S3 if it's not already present
-	for _, path := range files {
-		rel, err := filepath.Rel(localPath, path)
-		if err != nil {
-			log.Fatalln("Unable to get relative path:", path, err)
-		}
-		objectKey := filepath.Join(prefix, rel)
-		// Check if the object key already exists in S3
-		if _, ok := existingKeys[objectKey]; ok {
-			log.Printf("Skipped upload for %s - Already exists in S3\n", path)
-			continue
-		}
+	// Create a worker pool
+	const workerCount = 10
+	fileChan := make(chan string)
+	var wg sync.WaitGroup
 
-		// Open the file
-		file, err := os.Open(path)
-		if err != nil {
-			log.Println("Failed opening file", path, err)
-			continue
-		}
-		defer file.Close()
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for path := range fileChan {
+				rel, err := filepath.Rel(localPath, path)
+				if err != nil {
+					log.Println("Unable to get relative path:", path, err)
+					continue
+				}
+				objectKey := filepath.Join(prefix, rel)
+				// Check if the object key already exists in S3
+				if _, ok := existingKeys[objectKey]; ok {
+					log.Printf("Skipped upload for %s - Already exists in S3\n", path)
+					continue
+				}
 
-		// Upload the file to S3
-		_, err = uploader.Upload(context.TODO(), &s3.PutObjectInput{
-			Bucket: &bucket,
-			Key:    &objectKey,
-			Body:   file,
-		})
-		if err != nil {
-			log.Fatalln("Failed to upload", path, err)
-		}
-		log.Println("Uploaded", path, "to", objectKey)
+				// Open the file
+				file, err := os.Open(path)
+				if err != nil {
+					log.Println("Failed opening file", path, err)
+					continue
+				}
+
+				// Upload the file to S3
+				_, err = uploader.Upload(context.TODO(), &s3.PutObjectInput{
+					Bucket: &bucket,
+					Key:    &objectKey,
+					Body:   file,
+				})
+				file.Close() // Ensure the file is closed after the upload
+				if err != nil {
+					log.Println("Failed to upload", path, err)
+				} else {
+					log.Println("Uploaded", path, "to", objectKey)
+				}
+			}
+		}()
 	}
+
+	// Send files to workers
+	for _, path := range files {
+		fileChan <- path
+	}
+	close(fileChan)
+	wg.Wait()
 }
