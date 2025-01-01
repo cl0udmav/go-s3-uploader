@@ -11,6 +11,7 @@ go run main.go ${localPath} ${bucketName} ${s3PathPrefix}
 ```
 
 - Excludes specific macOS filenamess and external hard drive system files
+- Deletes objects from bucket if no longer present in local filesystem
 
 I used examples from this documentation and modified them for my needs:
 
