@@ -10,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 var (
@@ -22,9 +23,21 @@ func init() {
 	if len(os.Args) != 4 {
 		log.Fatalln("Usage:", os.Args[0], "<local path> <bucket> <prefix>")
 	}
+
 	localPath = os.Args[1]
+	if localPath == "" {
+		log.Fatalln("local path cannot be empty")
+	}
+
 	bucket = os.Args[2]
+	if bucket == "" {
+		log.Fatalln("bucket cannot be empty")
+	}
+
 	prefix = os.Args[3]
+	if prefix == "" {
+		log.Fatalln("prefix cannot be empty")
+	}
 }
 
 func main() {
@@ -39,31 +52,43 @@ func main() {
 
 	cfg, err := config.LoadDefaultConfig(context.TODO())
 	if err != nil {
-		log.Fatalln("error:", err)
+		log.Fatalln("Failed to load configuration:", err)
 	}
 
-	// For each file found walking, upload it to Amazon S3
+	if bucket == "" {
+		log.Fatalln("Bucket name cannot be empty")
+	}
+
+	// Upload the files to S3
 	uploader := manager.NewUploader(s3.NewFromConfig(cfg))
 	for path := range walker {
 		rel, err := filepath.Rel(localPath, path)
 		if err != nil {
-			log.Fatalln("Unable to get relative path:", path, err)
+			log.Println("Unable to get relative path:", path, err)
+			continue
 		}
 		file, err := os.Open(path)
 		if err != nil {
 			log.Println("Failed opening file", path, err)
 			continue
 		}
-		defer file.Close()
-		result, err := uploader.Upload(context.TODO(), &s3.PutObjectInput{
-			Bucket: &bucket,
-			Key:    aws.String(filepath.Join(prefix, rel)),
-			Body:   file,
-		})
-		if err != nil {
-			log.Fatalln("Failed to upload", path, err)
-		}
-		log.Println("Uploaded", path, result.Location)
+
+		// Ensure the file is closed after the upload
+		func() {
+			defer file.Close()
+			result, err := uploader.Upload(context.TODO(), &s3.PutObjectInput{
+				Bucket: &bucket,
+				Key:    aws.String(filepath.Join(prefix, rel)),
+				Body:   file,
+				// Ensure the storage class is Glacier
+				StorageClass: types.StorageClassGlacier,
+			})
+			if err != nil {
+				log.Println("Failed to upload", path, err)
+				return
+			}
+			log.Println("Uploaded", path, result.Location)
+		}()
 	}
 }
 
@@ -71,19 +96,82 @@ type fileWalk chan string
 
 func (f fileWalk) Walk(path string, info os.FileInfo, err error) error {
 
-	files, err := filepath.Glob("._")
-
-	if err != nil {
-		panic(err)
+	// Exclude specific macOS and external hard drive filenames
+	excludedFiles := []string{
+		".DS_Store",
+		"._*",
+		"$RECYCLE.BIN/*",
+		"$RECYCLE.BIN/**",
+		"**/._*",
+		".LaCie/*",
+		".Spotlight-V100/*",
+		".Trashes/*",
+		"*.inf",
+		"*.ico",
+		"*.icns",
+		"*.apdisk",
 	}
-	// Exclude filenames that start with "._"
-	for _, file := range files {
-		if err := os.Remove(file); err != nil {
-			panic(err)
+
+	for _, pattern := range excludedFiles {
+		matches, globErr := filepath.Glob(pattern)
+		if globErr != nil {
+			return globErr
+		}
+
+		for _, match := range matches {
+			removeErr := os.Remove(match)
+			if removeErr != nil {
+				return removeErr
+			}
 		}
 	}
+
 	if !info.IsDir() {
 		f <- path
 	}
-	return nil
+
+	// Get list of local files
+	localFiles := make(map[string]bool)
+	walkErr := filepath.Walk(".", func(path string, info os.FileInfo, innerErr error) error {
+		if !info.IsDir() {
+			localFiles[path] = true
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return err
+	}
+
+	cfg, err := config.LoadDefaultConfig(context.TODO())
+	if err != nil {
+		log.Fatalln("Failed to load configuration:", err)
+	}
+
+	s3Client := s3.NewFromConfig(cfg)
+
+	// Get list of objects in S3 bucket
+	objects, err := s3Client.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{
+		Bucket: aws.String(bucket),
+	})
+	if err != nil {
+		return err
+	}
+
+	// Delete objects in S3 bucket that are no longer present locally
+	for _, obj := range objects.Contents {
+		key := *obj.Key
+		if _, ok := localFiles[key]; !ok {
+			_, err := s3Client.DeleteObject(context.Background(), &s3.DeleteObjectInput{
+				Bucket: aws.String(bucket),
+				Key:    aws.String(key),
+			})
+			if err != nil {
+				log.Printf("Error deleting object %s: %v", key, err)
+			} else {
+				log.Printf("Deleted object %s", key)
+			}
+		}
+	}
+
+	return err
 }
