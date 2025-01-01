@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -41,16 +42,27 @@ func init() {
 }
 
 func main() {
-	walker := make(fileWalk)
-	go func() {
-		// Gather the files to upload by walking the path recursively
-		if err := filepath.Walk(localPath, walker.Walk); err != nil {
-			log.Fatalln("Walk failed:", err)
+	// Gather the files to upload by walking the path recursively
+	var files []string
+	if err := filepath.Walk(localPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
 		}
-		close(walker)
-	}()
+		// Exclude directories
+		if info.IsDir() {
+			return nil
+		}
+		// Exclude filenames that start with "._"
+		if strings.HasPrefix(info.Name(), "._") {
+			return nil
+		}
+		files = append(files, path)
+		return nil
+	}); err != nil {
+		log.Fatalln("Walk failed:", err)
+	}
 
-	cfg, err := config.LoadDefaultConfig(context.TODO())
+	cfg, err := config.LoadDefaultConfig(context.Background())
 	if err != nil {
 		log.Fatalln("Failed to load configuration:", err)
 	}
@@ -61,6 +73,7 @@ func main() {
 
 	// Upload the files to S3
 	uploader := manager.NewUploader(s3.NewFromConfig(cfg))
+	walker := make(fileWalk)
 	for path := range walker {
 		rel, err := filepath.Rel(localPath, path)
 		if err != nil {

@@ -4,7 +4,13 @@
 
 I made this to backup the many hours of cat videos on my external hard drive. Worth the S3 storage costs.
 
-- Excludes specific macOS filenames and external hard drive system files
+Run the script from the command line using positional arguments for local filesystem path, S3 bucket name, S3 path prefix.
+
+```text
+go run main.go ${localPath} ${bucketName} ${s3PathPrefix}
+```
+
+- Excludes specific macOS filenamess and external hard drive system files
 
 I used examples from this documentation and modified them for my needs:
 
