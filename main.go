@@ -5,29 +5,39 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 var (
-	localPath string
-	bucket    string
-	prefix    string
+	localDir   string
+	bucket     string
+	prefix     string
+	excludes   []string
+	s3Client   *s3.Client
+	uploader   *manager.Uploader
+	localFiles map[string]bool
 )
 
-func init() {
+func main() {
+	initVars()
+	initS3Client()
+	walkLocalDir()
+	uploadFiles()
+	deleteRemovedFiles()
+}
+
+func initVars() {
 	if len(os.Args) != 4 {
-		log.Fatalln("Usage:", os.Args[0], "<local path> <bucket> <prefix>")
+		log.Fatalln("Usage:", os.Args[0], "<local dir> <bucket> <prefix>")
 	}
 
-	localPath = os.Args[1]
-	if localPath == "" {
-		log.Fatalln("local path cannot be empty")
+	localDir = os.Args[1]
+	if localDir == "" {
+		log.Fatalln("local dir cannot be empty")
 	}
 
 	bucket = os.Args[2]
@@ -39,78 +49,8 @@ func init() {
 	if prefix == "" {
 		log.Fatalln("prefix cannot be empty")
 	}
-}
 
-func main() {
-	// Gather the files to upload by walking the path recursively
-	var files []string
-	if err := filepath.Walk(localPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		// Exclude directories
-		if info.IsDir() {
-			return nil
-		}
-		// Exclude filenames that start with "._"
-		if strings.HasPrefix(info.Name(), "._") {
-			return nil
-		}
-		files = append(files, path)
-		return nil
-	}); err != nil {
-		log.Fatalln("Walk failed:", err)
-	}
-
-	cfg, err := config.LoadDefaultConfig(context.Background())
-	if err != nil {
-		log.Fatalln("Failed to load configuration:", err)
-	}
-
-	if bucket == "" {
-		log.Fatalln("Bucket name cannot be empty")
-	}
-
-	// Upload the files to S3
-	uploader := manager.NewUploader(s3.NewFromConfig(cfg))
-	walker := make(fileWalk)
-	for path := range walker {
-		rel, err := filepath.Rel(localPath, path)
-		if err != nil {
-			log.Println("Unable to get relative path:", path, err)
-			continue
-		}
-		file, err := os.Open(path)
-		if err != nil {
-			log.Println("Failed opening file", path, err)
-			continue
-		}
-
-		// Ensure the file is closed after the upload
-		func() {
-			defer file.Close()
-			result, err := uploader.Upload(context.TODO(), &s3.PutObjectInput{
-				Bucket: &bucket,
-				Key:    aws.String(filepath.Join(prefix, rel)),
-				Body:   file,
-				// Ensure the storage class is Glacier
-				StorageClass: types.StorageClassGlacier,
-			})
-			if err != nil {
-				log.Println("Failed to upload", path, err)
-				return
-			}
-			log.Println("Uploaded", path, result.Location)
-		}()
-	}
-}
-
-type fileWalk chan string
-
-func (f fileWalk) Walk(path string, info os.FileInfo, err error) error {
-
-	// Exclude specific macOS and external hard drive filenames
-	excludedFiles := []string{
+	excludes = []string{
 		".DS_Store",
 		"._*",
 		"$RECYCLE.BIN/*",
@@ -124,50 +64,135 @@ func (f fileWalk) Walk(path string, info os.FileInfo, err error) error {
 		"*.icns",
 		"*.apdisk",
 	}
+}
 
-	for _, pattern := range excludedFiles {
-		matches, globErr := filepath.Glob(pattern)
-		if globErr != nil {
-			return globErr
-		}
-
-		for _, match := range matches {
-			removeErr := os.Remove(match)
-			if removeErr != nil {
-				return removeErr
-			}
-		}
-	}
-
-	if !info.IsDir() {
-		f <- path
-	}
-
-	// Get list of local files
-	localFiles := make(map[string]bool)
-	walkErr := filepath.Walk(".", func(path string, info os.FileInfo, innerErr error) error {
-		if !info.IsDir() {
-			localFiles[path] = true
-		}
-		return nil
-	})
-	if walkErr != nil {
-		return err
-	}
-
+func initS3Client() {
 	cfg, err := config.LoadDefaultConfig(context.TODO())
 	if err != nil {
 		log.Fatalln("Failed to load configuration:", err)
 	}
 
-	s3Client := s3.NewFromConfig(cfg)
+	s3Client = s3.NewFromConfig(cfg)
+	uploader = manager.NewUploader(s3Client)
+}
 
+func walkLocalDir() {
+	localFiles = make(map[string]bool)
+	walkErr := filepath.Walk(localDir, func(path string, info os.FileInfo, innerErr error) error {
+		if innerErr != nil {
+			return innerErr
+		}
+		if info.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(localDir, path)
+		if err != nil {
+			log.Println("Unable to get relative path:", path, err)
+			return nil
+		}
+		for _, exclude := range excludes {
+			if matched, err := filepath.Match(exclude, rel); err != nil || matched {
+				log.Printf("Excluding file: %s\n", rel)
+				return nil
+			}
+		}
+		localFiles[path] = true
+		return nil
+	})
+	if walkErr != nil {
+		log.Fatalln("Walk failed:", walkErr)
+	}
+}
+
+func uploadFiles() {
+	for path := range localFiles {
+		rel, err := filepath.Rel(localDir, path)
+		if err != nil {
+			log.Println("Unable to get relative path:", path, err)
+			continue
+		}
+
+		// Check if the object already exists in the S3 bucket
+		obj, err := s3Client.HeadObject(context.Background(), &s3.HeadObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(prefix + "/" + rel),
+		})
+		if err != nil {
+			log.Println("Skipping upload of non-existent file:", path)
+			continue
+		}
+
+		// Check the object's current storage class
+		currentStorageClass := obj.StorageClass
+
+		// If the object's storage class is not already GLACIER, update it
+		if currentStorageClass != "GLACIER" {
+			_, err = s3Client.CopyObject(context.Background(), &s3.CopyObjectInput{
+				Bucket:            aws.String(bucket),
+				Key:               aws.String(prefix + "/" + rel),
+				CopySource:        aws.String(bucket + "/" + prefix + "/" + rel),
+				StorageClass:      "GLACIER",
+				MetadataDirective: "COPY",
+			})
+			if err != nil {
+				log.Println("Error updating storage class:", err)
+				continue
+			}
+			log.Printf("Updated storage class of %q from STANDARD to GLACIER\n", path)
+		}
+
+		// Upload the file to S3
+		f, err := os.Open(path)
+		if err != nil {
+			log.Println("Error opening file:", err)
+			continue
+		}
+		defer f.Close()
+
+		_, err = uploader.Upload(context.Background(), &s3.PutObjectInput{
+			Bucket:       aws.String(bucket),
+			Key:          aws.String(prefix + "/" + rel),
+			Body:         f,
+			StorageClass: "GLACIER",
+		})
+		if err != nil {
+			log.Println("Error uploading file:", err)
+			continue
+		}
+
+		log.Println("Uploaded file:", path)
+		uploadFile(path, rel)
+	}
+}
+
+func uploadFile(localPath string, rel string) {
+	file, err := os.Open(localPath)
+	if err != nil {
+		log.Println("Unable to open file:", localPath, err)
+		return
+	}
+	defer file.Close()
+
+	_, err = uploader.Upload(context.Background(), &s3.PutObjectInput{
+		Bucket:       aws.String(bucket),
+		Key:          aws.String(prefix + "/" + rel),
+		Body:         file,
+		StorageClass: "GLACIER",
+	})
+	if err != nil {
+		log.Println("Unable to upload:", localPath, err)
+	} else {
+		log.Println("Uploaded:", localPath)
+	}
+}
+
+func deleteRemovedFiles() {
 	// Get list of objects in S3 bucket
 	objects, err := s3Client.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{
 		Bucket: aws.String(bucket),
 	})
 	if err != nil {
-		return err
+		log.Fatalln("Failed to list objects in S3 bucket:", err)
 	}
 
 	// Delete objects in S3 bucket that are no longer present locally
@@ -185,6 +210,4 @@ func (f fileWalk) Walk(path string, info os.FileInfo, err error) error {
 			}
 		}
 	}
-
-	return err
 }
