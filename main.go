@@ -118,27 +118,18 @@ func uploadFiles() {
 			Key:    aws.String(prefix + "/" + rel),
 		})
 		if err != nil {
-			log.Println("Skipping upload of non-existent file:", path)
-			continue
-		}
-
-		// Check the object's current storage class
-		currentStorageClass := obj.StorageClass
-
-		// If the object's storage class is not already GLACIER, update it
-		if currentStorageClass != "GLACIER" {
-			_, err = s3Client.CopyObject(context.Background(), &s3.CopyObjectInput{
-				Bucket:            aws.String(bucket),
-				Key:               aws.String(prefix + "/" + rel),
-				CopySource:        aws.String(bucket + "/" + prefix + "/" + rel),
-				StorageClass:      "GLACIER",
-				MetadataDirective: "COPY",
-			})
-			if err != nil {
-				log.Println("Error updating storage class:", err)
-				continue
+			log.Println("Skipping update of non-existent file:", path)
+		} else {
+			// Check the object's current storage class
+			currentStorageClass := obj.StorageClass
+			if currentStorageClass == "" {
+				currentStorageClass = "STANDARD" // default storage class
 			}
-			log.Printf("Updated storage class of %q from STANDARD to GLACIER\n", path)
+
+			// If the object's storage class is not already GLACIER, update it
+			if currentStorageClass != "GLACIER" {
+				log.Printf("Updating storage class of %q from %q to GLACIER\n", path, currentStorageClass)
+			}
 		}
 
 		// Upload the file to S3
